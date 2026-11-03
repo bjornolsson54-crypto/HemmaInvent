@@ -21,10 +21,66 @@ $('count').textContent=visible.length;$('expiring').textContent=visible.filter(r
 let cats=[...new Set(visible.map(r=>r.category).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'sv'));$('categoryFilter').innerHTML='<option value="">Alla kategorier</option>'+cats.map(c=>`<option value="${escapeHTML(c)}">${escapeHTML(c)}</option>`).join('');$('categoryFilter').value=cats.includes(category)?category:'';
 const found=visible.filter(r=>(!category||r.category===category)&&[r.name,r.brand,r.model,r.category,r.serial,r.location].join(' ').toLowerCase().includes(term)).sort((a,b)=>a.name.localeCompare(b.name,'sv'));
 $('list').replaceChildren();if(!found.length){$('list').innerHTML='<div class="card muted">Inga inventarier hittades.</div>';return;}
-for(const r of found){const b=document.createElement('button');b.className='item';const img=r.attachments?.find(a=>a.type.startsWith('image/'));b.innerHTML=(img?`<img class="thumb" alt="" src="${img.data}">`:'<span class="thumb">📦</span>')+`<span class="itemtext"><b>${escapeHTML(r.name)}</b><small>${escapeHTML([r.brand,r.model,r.category].filter(Boolean).join(' · '))}</small>${warranty(r)}</span><span>›</span>`;b.onclick=()=>edit(r.id);$('list').appendChild(b);}}
+for(const r of found){
+  const row=document.createElement('div');row.className='item';
+  const files=Array.isArray(r.attachments)?r.attachments:[], imageIndex=files.findIndex(a=>attachmentKind(a)==='image');
+  if(imageIndex>=0){const preview=document.createElement('button');preview.type='button';preview.className='image-preview';preview.setAttribute('aria-label','Visa bilder för '+r.name);const img=document.createElement('img');img.className='thumb';img.alt='';img.src=files[imageIndex].data;preview.append(img);preview.onclick=()=>openMedia(files,imageIndex,preview);row.append(preview);}
+  else{const icon=document.createElement('span');icon.className='thumb';icon.textContent='📦';row.append(icon);}
+  const b=document.createElement('button');b.type='button';b.className='item-edit';b.innerHTML='<span class="itemtext"><b>'+escapeHTML(r.name)+'</b><small>'+escapeHTML([r.brand,r.model,r.category].filter(Boolean).join(' · '))+'</small>'+warranty(r)+'</span><span>Redigera ›</span>';b.onclick=()=>edit(r.id);row.append(b);
+  files.forEach((f,i)=>{if(attachmentKind(f)==='pdf'){const pdf=document.createElement('button');pdf.type='button';pdf.className='secondary document-preview';pdf.textContent='📄 '+(f.name||'PDF-dokument');pdf.onclick=()=>openMedia(files,i,pdf);row.append(pdf);}});
+  $('list').append(row);
+}}
+
 function edit(id=null){activeId=id;const r=records.find(x=>x.id===id)||{};for(const f of fields)$('itemForm').elements[f].value=r[f]??'';$('editorTitle').textContent=id?'Redigera inventarie':'Ny inventarie';$('delete').classList.toggle('hidden',!id);$('attachment').value='';renderFiles(r.attachments||[]);$('overview').classList.add('hidden');$('settings').classList.add('hidden');$('editor').classList.remove('hidden');window.scrollTo(0,0);}
 let editingFiles=[];
-function renderFiles(files){editingFiles=structuredClone(files);$('filePreview').replaceChildren();files.forEach((f,i)=>{let div=document.createElement('div');div.className='row';let a=document.createElement('a');a.href=f.data;a.download=f.name;a.textContent='📎 '+f.name;a.target='_blank';div.append(a);let b=document.createElement('button');b.type='button';b.className='secondary';b.textContent='Ta bort';b.onclick=()=>{editingFiles.splice(i,1);renderFiles(editingFiles)};div.append(b);$('filePreview').append(div);});}
+function renderFiles(files){editingFiles=structuredClone(files);$('filePreview').replaceChildren();editingFiles.forEach((f,i)=>{const div=document.createElement('div');div.className='row';const kind=attachmentKind(f),open=document.createElement('button');open.type='button';open.className='secondary attachment-open';open.textContent=(kind==='image'?'🖼 ':kind==='pdf'?'📄 ':'📎 ')+(f.name||'Bilaga');open.disabled=!kind;if(!kind)open.title='Filformatet stöds inte för visning';if(kind==='image'){const img=document.createElement('img');img.src=f.data;img.alt='';open.prepend(img);}open.onclick=()=>openMedia(editingFiles,i,open);div.append(open);const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Ta bort';remove.onclick=()=>{editingFiles.splice(i,1);renderFiles(editingFiles);};div.append(remove);$('filePreview').append(div);});}
+// Attachments stay in the existing database format. Only validated, local
+// raster images and PDFs may be rendered; imported HTML/SVG/URLs are refused.
+function attachmentKind(f){
+  if(!f||typeof f.data!=='string'||f.data.length>8_000_000)return '';
+  const m=/^data:(image\/(?:jpeg|png|gif|webp)|application\/pdf);base64,([A-Za-z0-9+/\s]*={0,2})$/i.exec(f.data);
+  if(!m)return '';
+  const type=m[1].toLowerCase();
+  if(String(f.type).toLowerCase()!==type)return '';
+  try{const head=atob(m[2].replace(/\s/g,'').slice(0,32));
+    if(type==='application/pdf')return head.startsWith('%PDF-')?'pdf':'';
+    const valid=type==='image/jpeg'?head.startsWith('\xff\xd8\xff'):type==='image/png'?head.startsWith('\x89PNG\r\n\x1a\n'):type==='image/gif'?/^GIF8[79]a/.test(head):head.startsWith('RIFF')&&head.slice(8,12)==='WEBP';
+    return valid?'image':'';
+  }catch{return '';}
+}
+function attachmentBlob(f){const [header,body]=f.data.split(',');const bytes=Uint8Array.from(atob(body.replace(/\s/g,'')),c=>c.charCodeAt(0));return new Blob([bytes],{type:header.slice(5,header.indexOf(';'))});}
+const mediaDialog=document.createElement('dialog');mediaDialog.className='media-viewer';mediaDialog.setAttribute('aria-labelledby','mediaTitle');
+mediaDialog.innerHTML='<div class="media-shell"><div class="media-toolbar"><h2 id="mediaTitle"></h2><button type="button" id="mediaClose" autofocus aria-label="Stäng visaren">✕ Stäng</button></div><p id="mediaCount" role="status" aria-live="polite"></p><div class="media-actions"><button type="button" id="mediaPrev" aria-label="Föregående bild">← Föregående</button><button type="button" id="mediaNext" aria-label="Nästa bild">Nästa →</button><a id="mediaOpen" target="_blank" rel="noopener noreferrer">Öppna i ny flik</a><a id="mediaSave">Spara fil</a></div><p id="mediaHint"></p><div id="mediaStage"></div></div>';
+document.body.append(mediaDialog);
+let mediaFiles=[],mediaIndex=0,mediaURL=null,mediaOpener=null,oldOverflow='',swipe=null;
+function clearMedia(){ $('mediaStage').replaceChildren();if(mediaURL){URL.revokeObjectURL(mediaURL);mediaURL=null;}$('mediaOpen').removeAttribute('href');$('mediaSave').removeAttribute('href');swipe=null;}
+function drawMedia(){
+  clearMedia();const f=mediaFiles[mediaIndex],kind=attachmentKind(f);
+  $('mediaTitle').textContent=f.name||'Bilaga';
+  const image=kind==='image';$('mediaCount').textContent=image?'Bild '+(mediaIndex+1)+' av '+mediaFiles.length:'PDF-dokument';
+  $('mediaPrev').hidden=$('mediaNext').hidden=!image||mediaFiles.length<2;
+  $('mediaHint').textContent=image?'Svep åt sidan eller använd piltangenterna. Öppna i ny flik för att zooma.':'Läs och zooma med webbläsarens PDF-verktyg. Om dokumentet inte visas eller alla sidor inte syns: välj Öppna i ny flik eller Spara fil.';
+  mediaURL=URL.createObjectURL(attachmentBlob(f));$('mediaOpen').href=mediaURL;$('mediaSave').href=mediaURL;$('mediaSave').download=f.name|| (image?'bild.jpg':'dokument.pdf');
+  const el=document.createElement(image?'img':'iframe');
+  if(image){el.alt=f.name||'Inventariebild';el.draggable=false;el.onerror=()=>{$('mediaHint').textContent='Bilden kunde inte visas. Prova att öppna eller spara filen.';};}
+  else{el.title='PDF: '+(f.name||'Dokument');el.setAttribute('referrerpolicy','no-referrer');}
+  el.src=mediaURL;$('mediaStage').append(el);
+}
+function openMedia(files,index,opener){
+  const f=files[index],kind=attachmentKind(f);if(!kind){status('Bilagan kunde inte öppnas. Endast giltiga bildfiler och PDF stöds.',true);return;}
+  mediaFiles=kind==='image'?files.filter(x=>attachmentKind(x)==='image'):[f];mediaIndex=mediaFiles.indexOf(f);mediaOpener=opener||document.activeElement;
+  try{drawMedia();oldOverflow=document.body.style.overflow;mediaDialog.showModal();document.body.style.overflow='hidden';$('mediaClose').focus();}catch{clearMedia();status('Bilagan kunde inte visas i den här webbläsaren.',true);}
+}
+function stepMedia(delta){if(mediaFiles.length<2)return;mediaIndex=(mediaIndex+delta+mediaFiles.length)%mediaFiles.length;drawMedia();}
+$('mediaClose').onclick=()=>mediaDialog.close();$('mediaPrev').onclick=()=>stepMedia(-1);$('mediaNext').onclick=()=>stepMedia(1);
+mediaDialog.addEventListener('close',()=>{clearMedia();mediaFiles=[];document.body.style.overflow=oldOverflow;if(mediaOpener?.isConnected)mediaOpener.focus();mediaOpener=null;});
+mediaDialog.addEventListener('keydown',e=>{if(attachmentKind(mediaFiles[mediaIndex])!=='image')return;if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();stepMedia(e.key==='ArrowLeft'?-1:1);}});
+const mediaStage=$('mediaStage');
+mediaStage.addEventListener('touchstart',e=>{swipe=e.touches.length===1?{x:e.touches[0].clientX,y:e.touches[0].clientY,time:Date.now()}:null;},{passive:true});
+mediaStage.addEventListener('touchmove',e=>{if(e.touches.length!==1)swipe=null;},{passive:true});
+mediaStage.addEventListener('touchcancel',()=>{swipe=null;},{passive:true});
+mediaStage.addEventListener('touchend',e=>{const start=swipe;swipe=null;if(!start||e.touches.length||!e.changedTouches.length||attachmentKind(mediaFiles[mediaIndex])!=='image')return;const dx=e.changedTouches[0].clientX-start.x,dy=e.changedTouches[0].clientY-start.y;if(Date.now()-start.time<1000&&Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy)*1.5)stepMedia(dx<0?1:-1);},{passive:true});
+
 async function toAttachment(file){if(file.type.startsWith('image/')){let bitmap=await createImageBitmap(file);let scale=Math.min(1,1400/Math.max(bitmap.width,bitmap.height));let canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(bitmap.width*scale));canvas.height=Math.max(1,Math.round(bitmap.height*scale));canvas.getContext('2d').drawImage(bitmap,0,0,canvas.width,canvas.height);bitmap.close();let quality=.76,data=canvas.toDataURL('image/jpeg',quality);while(data.length>1_300_000&&quality>.3){quality-=.12;data=canvas.toDataURL('image/jpeg',quality);}if(data.length>1_300_000)throw Error('Bilden är för stor även efter komprimering.');return {name:file.name.replace(/\.[^.]+$/,'.jpg'),type:'image/jpeg',data};}if(file.type!=='application/pdf')throw Error('Endast bilder och PDF stöds.');if(file.size>1_000_000)throw Error('PDF-filen får vara högst 1 MB.');return await new Promise((res,rej)=>{let r=new FileReader();r.onload=()=>res({name:file.name,type:file.type,data:r.result});r.onerror=()=>rej(r.error);r.readAsDataURL(file)});}
 function authHeaders(token){return {'apikey':cfg.supabaseAnonKey,'Authorization':'Bearer '+(token||cfg.supabaseAnonKey),'Content-Type':'application/json'};}
 async function authCall(path,body){let r=await fetch(api+'/auth/v1/'+path,{method:'POST',headers:authHeaders(),body:JSON.stringify(body)});let d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.msg||d.error_description||d.message||'Inloggning misslyckades');return d;}
