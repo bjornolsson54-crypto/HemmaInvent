@@ -16,20 +16,43 @@ function userScope(){return session?.user?.id||'local';}
 async function refreshList(){records=(await all('records')).filter(r=>r.owner===userScope());render();}
 function showApp(){ $('auth').classList.add('hidden');$('app').classList.remove('hidden');$('settings').classList.add('hidden');$('editor').classList.add('hidden');$('overview').classList.remove('hidden');$('who').textContent=session?'Inloggad som '+session.user.email:'Lokalt läge – ingen automatisk synkning';refreshList();}
 function warranty(r){if(!r.warrantyEnd)return '';let days=Math.ceil((new Date(r.warrantyEnd+'T12:00:00')-new Date())/86400000);return days<0?'<span class="pill bad">Garanti slut</span>':days<=30?'<span class="pill warn">Garanti går snart ut</span>':'<span class="pill">Garanti gäller</span>';}
-function render(){const visible=records.filter(r=>!r.deleted),term=$('search').value.toLowerCase(),category=$('categoryFilter').value;
+// View state only: inventory records and the database format stay unchanged.
+const categoryOpenState=new Map();
+const categoryName=r=>String(r.category??'').trim()||'Övrigt';
+function render(){
+const visible=records.filter(r=>!r.deleted),term=$('search').value.toLowerCase(),selectedCategory=$('categoryFilter').value;
 $('count').textContent=visible.length;$('expiring').textContent=visible.filter(r=>r.warrantyEnd&&((new Date(r.warrantyEnd+'T12:00:00')-new Date())/86400000)>=0&&((new Date(r.warrantyEnd+'T12:00:00')-new Date())/86400000)<=30).length;
-let cats=[...new Set(visible.map(r=>r.category).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'sv'));$('categoryFilter').innerHTML='<option value="">Alla kategorier</option>'+cats.map(c=>`<option value="${escapeHTML(c)}">${escapeHTML(c)}</option>`).join('');$('categoryFilter').value=cats.includes(category)?category:'';
-const found=visible.filter(r=>(!category||r.category===category)&&[r.name,r.brand,r.model,r.category,r.serial,r.location].join(' ').toLowerCase().includes(term)).sort((a,b)=>a.name.localeCompare(b.name,'sv'));
+const cats=[...new Set(visible.map(categoryName))].sort((a,b)=>a.localeCompare(b,'sv'));
+$('categoryFilter').innerHTML='<option value="">Alla kategorier</option>'+cats.map(c=>`<option value="${escapeHTML(c)}">${escapeHTML(c)}</option>`).join('');
+const category=cats.includes(selectedCategory)?selectedCategory:'';
+$('categoryFilter').value=category;
+const found=visible.filter(r=>(!category||categoryName(r)===category)&&[r.name,r.brand,r.model,categoryName(r),r.serial,r.location].join(' ').toLowerCase().includes(term)).sort((a,b)=>a.name.localeCompare(b.name,'sv'));
 $('list').replaceChildren();if(!found.length){$('list').innerHTML='<div class="card muted">Inga inventarier hittades.</div>';return;}
-for(const r of found){
+const groups=new Map();
+for(const r of found){const name=categoryName(r);if(!groups.has(name))groups.set(name,[]);groups.get(name).push(r);}
+for(const name of cats){
+  const items=groups.get(name);if(!items)continue;
+  const group=document.createElement('details');group.className='category-group';
+  group.open=!!term||categoryOpenState.get(name)===true;
+  const summary=document.createElement('summary');summary.className='category-summary';
+  const title=document.createElement('span');title.className='category-title';title.textContent=name;
+  const count=document.createElement('span');count.className='category-count';count.textContent=items.length+' '+(items.length===1?'inventarie':'inventarier');
+  summary.append(title,count);group.append(summary);
+  const content=document.createElement('div');content.className='category-items';group.append(content);
+  // Search temporarily opens matches without overwriting the user's choices.
+  group.addEventListener('toggle',()=>{if(group.isConnected&&!term)categoryOpenState.set(name,group.open);});
+  for(const r of items){
   const row=document.createElement('div');row.className='item';
   const files=Array.isArray(r.attachments)?r.attachments:[], imageIndex=files.findIndex(a=>attachmentKind(a)==='image');
   if(imageIndex>=0){const preview=document.createElement('button');preview.type='button';preview.className='image-preview';preview.setAttribute('aria-label','Visa bilder för '+r.name);const img=document.createElement('img');img.className='thumb';img.alt='';img.src=files[imageIndex].data;preview.append(img);preview.onclick=()=>openMedia(files,imageIndex,preview);row.append(preview);}
   else{const icon=document.createElement('span');icon.className='thumb';icon.textContent='📦';row.append(icon);}
   const b=document.createElement('button');b.type='button';b.className='item-edit';b.innerHTML='<span class="itemtext"><b>'+escapeHTML(r.name)+'</b><small>'+escapeHTML([r.brand,r.model,r.category].filter(Boolean).join(' · '))+'</small>'+warranty(r)+'</span><span>Redigera ›</span>';b.onclick=()=>edit(r.id);row.append(b);
   files.forEach((f,i)=>{if(attachmentKind(f)==='pdf'){const pdf=document.createElement('button');pdf.type='button';pdf.className='secondary document-preview';pdf.textContent='📄 '+(f.name||'PDF-dokument');pdf.onclick=()=>openMedia(files,i,pdf);row.append(pdf);}});
-  $('list').append(row);
-}}
+  content.append(row);
+  }
+  $('list').append(group);
+}
+}
 
 function edit(id=null){activeId=id;const r=records.find(x=>x.id===id)||{};for(const f of fields)$('itemForm').elements[f].value=r[f]??'';$('editorTitle').textContent=id?'Redigera inventarie':'Ny inventarie';$('delete').classList.toggle('hidden',!id);$('attachment').value='';renderFiles(r.attachments||[]);$('overview').classList.add('hidden');$('settings').classList.add('hidden');$('editor').classList.remove('hidden');window.scrollTo(0,0);}
 let editingFiles=[];
