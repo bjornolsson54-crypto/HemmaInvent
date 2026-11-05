@@ -16,9 +16,38 @@ function userScope(){return session?.user?.id||'local';}
 async function refreshList(){records=(await all('records')).filter(r=>r.owner===userScope());render();}
 function showApp(){ $('auth').classList.add('hidden');$('app').classList.remove('hidden');$('settings').classList.add('hidden');$('editor').classList.add('hidden');$('overview').classList.remove('hidden');$('who').textContent=session?'Inloggad som '+session.user.email:'Lokalt läge – ingen automatisk synkning';refreshList();}
 function warranty(r){if(!r.warrantyEnd)return '';let days=Math.ceil((new Date(r.warrantyEnd+'T12:00:00')-new Date())/86400000);return days<0?'<span class="pill bad">Garanti slut</span>':days<=30?'<span class="pill warn">Garanti går snart ut</span>':'<span class="pill">Garanti gäller</span>';}
-// View state only: inventory records and the database format stay unchanged.
+// Category display state; renames update the existing inventory records.
 const categoryOpenState=new Map();
 const categoryName=r=>String(r.category??'').trim()||'Övrigt';
+async function renameCategory(name,newName){
+  newName=newName.trim();
+  if(!newName){status('Skriv ett kategorinamn.',true);return false;}
+  if(newName===name)return true;
+  if(busy){status('Vänta tills synkningen eller sparningen är klar och försök igen.');return false;}
+  const affected=records.filter(r=>!r.deleted&&categoryName(r)===name);
+  if(!affected.length)return false;
+  if(records.some(r=>!r.deleted&&categoryName(r)===newName)&&!confirm('Kategorin ”'+newName+'” finns redan. Vill du slå ihop ”'+name+'” med den?'))return false;
+  busy=true;$('sync').disabled=true;
+  try{
+    const updatedAt=new Date().toISOString();
+    // One transaction makes the rename all-or-nothing, including when offline.
+    await new Promise((resolve,reject)=>{
+      const transaction=db.transaction('records','readwrite');
+      transaction.oncomplete=resolve;
+      transaction.onabort=()=>reject(transaction.error||Error('Kunde inte spara kategorinamnet.'));
+      transaction.onerror=()=>{};
+      const target=transaction.objectStore('records');
+      for(const r of affected)target.put({...r,category:newName,dirty:!!session,updatedAt});
+    });
+    categoryOpenState.set(newName,true);categoryOpenState.delete(name);
+    if($('categoryFilter').value===name){const option=document.createElement('option');option.value=newName;option.textContent=newName;$('categoryFilter').append(option);$('categoryFilter').value=newName;}
+    await refreshList();
+    status('Kategorin heter nu ”'+newName+'”. '+affected.length+' inventarier uppdaterades.'+(session?' Ändringen sparas lokalt och synkas när internet finns.':''));
+  }catch(e){status('Kunde inte byta kategorinamn: '+e.message,true);return false;}
+  finally{busy=false;$('sync').disabled=false;}
+  if(session)sync();
+  return true;
+}
 function render(){
 const visible=records.filter(r=>!r.deleted),term=$('search').value.toLowerCase(),selectedCategory=$('categoryFilter').value;
 $('count').textContent=visible.length;$('expiring').textContent=visible.filter(r=>r.warrantyEnd&&((new Date(r.warrantyEnd+'T12:00:00')-new Date())/86400000)>=0&&((new Date(r.warrantyEnd+'T12:00:00')-new Date())/86400000)<=30).length;
@@ -39,6 +68,16 @@ for(const name of cats){
   const count=document.createElement('span');count.className='category-count';count.textContent=items.length+' '+(items.length===1?'inventarie':'inventarier');
   summary.append(title,count);group.append(summary);
   const content=document.createElement('div');content.className='category-items';group.append(content);
+  const tools=document.createElement('div');tools.className='row';tools.style.marginBottom='10px';
+  const rename=document.createElement('button');rename.type='button';rename.className='secondary';rename.textContent='Byt kategorinamn';rename.setAttribute('aria-label','Byt namn på kategorin '+name);
+  const form=document.createElement('form');form.className='row hidden';
+  const input=document.createElement('input');input.type='text';input.className='grow';input.value=name;input.required=true;input.setAttribute('aria-label','Nytt kategorinamn');
+  const save=document.createElement('button');save.type='submit';save.textContent='Spara namn';
+  const cancel=document.createElement('button');cancel.type='button';cancel.className='secondary';cancel.textContent='Avbryt';
+  rename.onclick=()=>{rename.classList.add('hidden');form.classList.remove('hidden');input.value=name;input.focus();input.select();};
+  cancel.onclick=()=>{form.classList.add('hidden');rename.classList.remove('hidden');rename.focus();};
+  form.onsubmit=async e=>{e.preventDefault();save.disabled=true;try{if(await renameCategory(name,input.value)){form.classList.add('hidden');rename.classList.remove('hidden');}}finally{save.disabled=false;}};
+  form.append(input,save,cancel);tools.append(rename,form);content.append(tools);
   // Search temporarily opens matches without overwriting the user's choices.
   group.addEventListener('toggle',()=>{if(group.isConnected&&!term)categoryOpenState.set(name,group.open);});
   for(const r of items){
