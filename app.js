@@ -30,12 +30,31 @@ function categoryPaths(){
   }
   return [...paths].sort((a,b)=>a.localeCompare(b,'sv'));
 }
-function fillCategoryChoices(){
-  $('categorySuggestions').replaceChildren();
-  for(const path of [...new Set([...categoryPaths(),'Färg & målning','Verktyg','Byggmaterial','Trädgård','Elektronik','Vitvaror'])]){
-    const option=document.createElement('option');option.value=path;$('categorySuggestions').append(option);
-  }
+
+function editorCategoryPaths(){return [...new Set([...categoryPaths(),'Färg & målning','Verktyg','Byggmaterial','Trädgård','Elektronik','Vitvaror','Övrigt'])].sort((a,b)=>a.localeCompare(b,'sv'));}
+function categoryOption(select,value,label=value){const option=document.createElement('option');option.value=value;option.textContent=label;select.append(option);}
+function setEditorCategory(path){
+  const normalized=categoryName({category:path}),root=normalized.split(' → ')[0];
+  const paths=[...new Set([...editorCategoryPaths(),normalized])];
+  $('itemMainCategory').replaceChildren();
+  for(const main of [...new Set(paths.map(p=>p.split(' → ')[0]))].sort((a,b)=>a.localeCompare(b,'sv')))categoryOption($('itemMainCategory'),main);
+  $('itemMainCategory').value=root;
+  $('itemSubcategory').replaceChildren();categoryOption($('itemSubcategory'),'','Ingen – direkt i huvudkategorin');
+  for(const child of paths.filter(p=>p.startsWith(root+' → ')).sort((a,b)=>a.localeCompare(b,'sv')))categoryOption($('itemSubcategory'),child,child.slice(root.length+3));
+  $('itemSubcategory').value=normalized===root?'':normalized;
+  $('itemCategory').value=path;
+  updateCategoryDestination();
 }
+function updateCategoryDestination(){
+  $('categoryDestination').textContent='Sparas i: '+categoryName({category:$('itemCategory').value});
+}
+function chooseEditorCategory(){
+  $('itemCategory').value=$('itemSubcategory').value||$('itemMainCategory').value;
+  updateCategoryDestination();
+  // Moving an existing item must not change its paint settings.
+  if(!activeId&&/färg|målning|lasyr|lack/i.test($('itemCategory').value)){$('paintEnabled').checked=true;togglePaint();}
+}
+let categoryForEditor=false;
 function writeRecords(rows){
   return new Promise((resolve,reject)=>{
     const transaction=db.transaction('records','readwrite');
@@ -115,7 +134,7 @@ function render(){
   $('expiring').textContent=visible.filter(r=>r.warrantyEnd&&((new Date(r.warrantyEnd+'T12:00:00')-new Date())/86400000)>=0&&((new Date(r.warrantyEnd+'T12:00:00')-new Date())/86400000)<=30).length;
   $('categoryFilter').replaceChildren();const allOption=document.createElement('option');allOption.value='';allOption.textContent='Alla kategorier';$('categoryFilter').append(allOption);
   for(const path of paths){const option=document.createElement('option');option.value=path;option.textContent=path;$('categoryFilter').append(option);}
-  const category=paths.includes(selected)?selected:'';$('categoryFilter').value=category;fillCategoryChoices();
+  const category=paths.includes(selected)?selected:'';$('categoryFilter').value=category;
   const found=visible.filter(r=>(!category||belowCategory(categoryName(r),category))&&searchText(r).includes(term)).sort((a,b)=>a.name.localeCompare(b.name,'sv'));
   $('list').replaceChildren();
   const makeGroup=(path)=>{
@@ -198,7 +217,7 @@ async function edit(id=null){
   for(const f of fields)$('itemForm').elements[f].value=r[f]??'';
   $('editorTitle').textContent=id?'Redigera inventarie':'Ny inventarie';$('delete').classList.toggle('hidden',!id);$('attachment').value='';renderFiles(r.attachments||[]);
   $('paintEnabled').checked=r.paintEnabled??!!r.paint;for(const key of paintFields)$('paint-'+key).value=r.paint?.[key]??'';
-  $('paintingUses').replaceChildren();for(const use of (Array.isArray(r.paint?.uses)?r.paint.uses:[]))addPaintingUse(use);togglePaint();fillCategoryChoices();
+  $('paintingUses').replaceChildren();for(const use of (Array.isArray(r.paint?.uses)?r.paint.uses:[]))addPaintingUse(use);togglePaint();setEditorCategory(r.category??'');
   $('overview').classList.add('hidden');$('settings').classList.add('hidden');$('editor').classList.remove('hidden');editorBaseline=editorSnapshot();window.scrollTo(0,0);
 }
 async function saveItem(){
@@ -301,10 +320,13 @@ $('keepEditing').onclick=()=>finishLeave(false);$('discardChanges').onclick=()=>
 $('leaveDialog').addEventListener('cancel',e=>{e.preventDefault();finishLeave(false);});
 window.addEventListener('beforeunload',e=>{if(editorSaving||hasUnsavedChanges()){e.preventDefault();e.returnValue='';}});
 $('paintEnabled').onchange=togglePaint;$('addPaintingUse').onclick=()=>addPaintingUse();
-$('itemCategory').addEventListener('change',()=>{if(/färg|målning|lasyr|lack/i.test($('itemCategory').value)){$('paintEnabled').checked=true;togglePaint();}});
-$('newCategory').onclick=()=>openCategoryDialog();
+$('itemMainCategory').onchange=()=>{setEditorCategory($('itemMainCategory').value);chooseEditorCategory();};
+$('itemSubcategory').onchange=chooseEditorCategory;
+$('editorNewMainCategory').onclick=()=>{categoryForEditor=true;openCategoryDialog();};
+$('editorNewSubcategory').onclick=()=>{categoryForEditor=true;openCategoryDialog($('itemMainCategory').value);};
+$('newCategory').onclick=()=>{categoryForEditor=false;openCategoryDialog();};
 $('categoryCancel').onclick=()=>$('categoryDialog').close();
-$('categoryForm').onsubmit=async e=>{e.preventDefault();$('categoryCreate').disabled=true;try{if(await createCategory($('categoryParent').value,$('categoryNewName').value))$('categoryDialog').close();}finally{$('categoryCreate').disabled=false;}};
+$('categoryForm').onsubmit=async e=>{e.preventDefault();$('categoryCreate').disabled=true;try{const parent=$('categoryParent').value,name=$('categoryNewName').value.trim();if(await createCategory(parent,name)){if(categoryForEditor){setEditorCategory(parent?parent+' → '+name:name);chooseEditorCategory();}categoryForEditor=false;$('categoryDialog').close();}}finally{$('categoryCreate').disabled=false;}};
 $('login').onclick=async()=>{if(!configured)return status('Konfigurera Supabase i config.js först.',true);try{let d=await authCall('token?grant_type=password',{email:$('email').value.trim(),password:$('password').value});session={...d,expires_at:Math.floor(Date.now()/1000)+d.expires_in};await saveSetting('session',session);mode='cloud';await saveSetting('mode',mode);showApp();sync();}catch(e){status(e.message,true);}};
 $('signup').onclick=async()=>{if(!configured)return status('Konfigurera Supabase i config.js först.',true);try{let d=await authCall('signup',{email:$('email').value.trim(),password:$('password').value});if(d.access_token){session={...d,expires_at:Math.floor(Date.now()/1000)+d.expires_in};await saveSetting('session',session);mode='cloud';await saveSetting('mode',mode);showApp();sync();}else status('Kontot skapades. Bekräfta via e-post och logga sedan in.');}catch(e){status(e.message,true);}};
 $('local').onclick=async()=>{mode='local';session=null;await saveSetting('mode',mode);await saveSetting('session',null);showApp();status('Lokalt läge. Dina uppgifter synkas inte.');};
