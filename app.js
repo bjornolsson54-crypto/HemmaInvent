@@ -21,22 +21,35 @@ function accountDisplayName(){
   const name=metadata.display_name??metadata.full_name??metadata.name;
   return typeof name==='string'?name.trim().slice(0,100):'';
 }
-function renderAccountIdentity(){
-  const name=accountDisplayName();
-  $('signedInUser').textContent=session?(name?'Inloggad '+name:'Inloggad · Ange namn'):'Inte inloggad';
-  $('signedInUser').disabled=!session;
-  $('who').textContent=session?(name?'Inloggad som '+name:'Inloggad – ange ditt namn nedan.'):'Lokalt läge – ingen automatisk synkning';
-  $('displayNameSection').classList.toggle('hidden',!session);
+function renderConnectionState(){
+  $('connectionStatus').textContent=session?(navigator.onLine?'Inloggad · Online':'Inloggad · Offline – ändringar sparas på enheten'):(!$('app').classList.contains('hidden')?'Utan konto · ingen synkning':'Inte inloggad');
 }
-function openAccountSettings(){
+function closeAccountMenu(){$('accountMenu').open=false;}
+function renderAccountIdentity(){
+  const name=accountDisplayName(),inApp=!$('app').classList.contains('hidden');
+  $('signedInUser').textContent=session?(name||'Mitt konto')+' ▾':'På denna enhet ▾';
+  $('accountMenu').classList.toggle('hidden',!inApp);closeAccountMenu();
+  $('who').textContent=session?(name?'Inloggad som '+name:'Inloggad på ditt konto.'):'Utan konto – separat lokal lista i denna webbläsare.';
+  $('accountEmail').textContent=session?.user?.email?'Kontots e-post: '+session.user.email:'';
+  $('displayNameSection').classList.toggle('hidden',!session);
+  for(const id of ['menuSwitch','menuLogout','settingsSwitch','logout'])$(id).classList.toggle('hidden',!session);
+  for(const id of ['menuLogin','settingsLogin'])$(id).classList.toggle('hidden',!!session);
+  $('menuAccount').textContent=session?'Mitt konto':'Om lokalt läge';
+  $('inventoryContext').textContent=session?'Inventarier på ditt konto. Sparade offlinekopior kan visas även utan internet.':'Separat lista på denna enhet. Kontots inventarier visas först när du loggar in.';
+  renderConnectionState();
+}
+async function openAccountSettings(section='account'){
+  closeAccountMenu();if(!await confirmLeave())return;
   clearDraft();$('overview').classList.add('hidden');$('editor').classList.add('hidden');$('settings').classList.remove('hidden');
   renderAccountIdentity();$('displayName').value=accountDisplayName();$('profileStatus').textContent='';
+  $('settingsTitle').textContent=section==='backup'?'Säkerhetskopiering':(session?'Mitt konto':'På denna enhet');
+  const target=section==='backup'?$('backupSection'):$('settingsTitle');target.focus();target.scrollIntoView({block:'start',behavior:'smooth'});
 }
 let profileSaving=false;
 async function saveDisplayName(){
   if(!session||profileSaving)return;
   const name=$('displayName').value.trim();
-  if(!name||name.length>100){$('profileStatus').textContent='Ange ett namn med högst 100 tecken.';return;}
+  if(name.length>100){$('profileStatus').textContent='Namnet får ha högst 100 tecken.';return;}
   if(!navigator.onLine){$('profileStatus').textContent='Anslut till internet för att spara namnet på ditt konto.';return;}
   if(busy){$('profileStatus').textContent='Vänta tills synkningen är klar och försök igen.';return;}
   profileSaving=true;busy=true;$('saveDisplayName').disabled=true;$('displayName').disabled=true;$('sync').disabled=true;
@@ -332,8 +345,9 @@ let authBusy=false,recoveryActive=false,recoverySession=null,resetRetryAt=0;
 const authControls=['login','signup','local','forgotPassword','createAccount','cancelSignup','sendReset','cancelResetRequest','saveNewPassword','cancelNewPassword'];
 function setAuthBusy(value){authBusy=value;for(const id of authControls)$(id).disabled=value;}
 function showAuthPanel(id='auth'){
-  clearDraft();$('app').classList.add('hidden');
+  closeAccountMenu();clearDraft();$('app').classList.add('hidden');
   for(const panel of ['auth','signupPanel','resetRequestPanel','resetPasswordPanel'])$(panel).classList.toggle('hidden',panel!==id);
+  renderAccountIdentity();
 }
 function authRedirectUrl(){
   const url=new URL(cfg.appUrl||location.href);
@@ -366,7 +380,7 @@ async function loginAccount(){
 async function signupAccount(){
   if(authBusy)return;if(!configured)return status('Konfigurera Supabase i config.js först.',true);
   const name=$('signupName').value.trim(),email=$('signupEmail').value.trim(),password=$('signupPassword').value;
-  if(!name||name.length>100){$('signupStatus').textContent='Ange ditt namn (högst 100 tecken).';return;}
+  if(name.length>100){$('signupStatus').textContent='Namnet får ha högst 100 tecken.';return;}
   if(password.length<8||password!==$('signupPasswordConfirm').value){$('signupStatus').textContent='Lösenorden måste vara lika och ha minst 8 tecken.';return;}
   setAuthBusy(true);$('signupStatus').textContent='Skapar konto …';
   try{
@@ -436,7 +450,7 @@ async function finishPasswordReset(){
     await authRequest('user',{method:'PUT',token:recoverySession.access_token,body:{password}});
     const email=recoverySession.user.email||'';
     // Ask for a fresh login after resetting, without importing or syncing any data.
-    session=null;mode='local';records=[];await saveSetting('session',null);await saveSetting('mode','local');
+    session=null;mode='signedout';records=[];await saveSetting('session',null);await saveSetting('mode','signedout');
     recoverySession=null;recoveryActive=false;$('newPassword').value='';$('confirmNewPassword').value='';$('password').value='';$('email').value=email;
     showAuthPanel();renderAccountIdentity();status('Lösenordet är ändrat. Logga in med ditt nya lösenord.');
   }catch(error){$('resetPasswordStatus').textContent='Kunde inte ändra lösenordet: '+error.message;}
@@ -445,13 +459,13 @@ async function finishPasswordReset(){
 function cancelPasswordReset(){
   if(authBusy)return;recoverySession=null;recoveryActive=false;$('newPassword').value='';$('confirmNewPassword').value='';showAuthPanel();status('Logga in för att fortsätta.');
 }
-async function returnToLogin(){
+async function returnToLogin(action='logout'){
   if(busy||editorSaving||authBusy){status('Vänta tills sparningen eller synkningen är klar.');return;}
   if(!await confirmLeave())return;
-  session=null;mode='local';records=[];clearDraft();
-  await saveSetting('session',null);await saveSetting('mode','local');
+  closeAccountMenu();session=null;mode='signedout';records=[];clearDraft();
+  await saveSetting('session',null);await saveSetting('mode','signedout');
   $('list').replaceChildren();$('search').value='';$('categoryFilter').value='';
-  $('password').value='';showAuthPanel();renderAccountIdentity();status('Utloggad. Dina sparade inventarier finns kvar på enheten för ditt konto.');
+  $('email').value='';$('password').value='';showAuthPanel();renderAccountIdentity();status(action==='switch'?'Logga in på ett annat konto. Varje konto har sin egen lista.':action==='login'?'Logga in för att se kontots inventarier. Den separata lokala listan finns kvar.':'Du är utloggad. Logga in igen för att se kontots inventarier.');
 }
 
 function authHeaders(token){return {'apikey':cfg.supabaseAnonKey,'Authorization':'Bearer '+(token||cfg.supabaseAnonKey),'Content-Type':'application/json'};}
@@ -477,8 +491,13 @@ $('delete').onclick=async()=>{
 $('new').onclick=()=>edit();
 $('cancel').onclick=async()=>{if(await confirmLeave())showOverview();};
 $('search').oninput=render;$('categoryFilter').onchange=render;$('sync').onclick=sync;
-$('account').onclick=async()=>{if(!await confirmLeave())return;openAccountSettings();};
-$('signedInUser').onclick=()=>$('account').click();
+$('menuAccount').onclick=()=>openAccountSettings();
+$('menuBackup').onclick=()=>openAccountSettings('backup');
+for(const id of ['menuSwitch','settingsSwitch'])$(id).onclick=()=>returnToLogin('switch');
+for(const id of ['menuLogout','logout'])$(id).onclick=()=>returnToLogin('logout');
+for(const id of ['menuLogin','settingsLogin'])$(id).onclick=()=>returnToLogin('login');
+document.addEventListener('click',e=>{if(!$('accountMenu').contains(e.target))closeAccountMenu();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('accountMenu').open){closeAccountMenu();$('signedInUser').focus();}});
 $('displayNameForm').onsubmit=async e=>{e.preventDefault();await saveDisplayName();};
 $('closeSettings').onclick=()=>showOverview();
 $('homeLink').onclick=async e=>{e.preventDefault();if(!await confirmLeave())return;if(!$('app').classList.contains('hidden'))showOverview(true);window.scrollTo(0,0);};
@@ -503,7 +522,7 @@ $('cancelResetRequest').onclick=()=>{if(!authBusy)showAuthPanel();};
 $('resetPasswordForm').onsubmit=async e=>{e.preventDefault();await finishPasswordReset();};
 $('cancelNewPassword').onclick=cancelPasswordReset;
 $('local').onclick=async()=>{if(authBusy)return;mode='local';session=null;records=[];await saveSetting('mode',mode);await saveSetting('session',null);showApp();status('Lokalt läge. Dina uppgifter synkas inte.');};
-$('logout').onclick=returnToLogin;
+
 $('export').onclick=async()=>{let data={format:'hemmainvent-v2',exportedAt:new Date().toISOString(),records:records};let blob=new Blob([JSON.stringify(data)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='hemmainvent-backup-'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);};
 async function importBackupRecords(data,{locked=false}={}){
   if(!locked&&(busy||editorSaving||authBusy))throw Error('Vänta tills sparningen eller synkningen är klar.');
@@ -543,6 +562,6 @@ $('importFile').onchange=async e=>{
   finally{busy=false;setAuthBusy(false);$('sync').disabled=false;e.target.value='';}
   if(session)sync();
 };
-window.addEventListener('online',()=>{if(session)sync();else status('Online.');});window.addEventListener('offline',()=>status('Offline – uppgifter sparas lokalt.'));
+window.addEventListener('online',()=>{renderConnectionState();if(session)sync();else status('Online. Lokalt läge synkas inte.');});window.addEventListener('offline',()=>{renderConnectionState();status(session?'Offline – ändringar sparas på enheten och synkas när internet återkommer.':'Offline – den separata lokala listan sparas på denna enhet.');});
 const initialAuthCallback=captureAuthCallback();
 (async()=>{try{db=await openDB();mode=await getSetting('mode')||'local';session=await getSetting('session')||null;if(await handleAuthCallback(initialAuthCallback))return;if(mode==='cloud'&&session&&configured){try{if(navigator.onLine)await ensureToken();showApp();if(navigator.onLine)sync();else status('Offline – visar lokalt sparade inventarier.');}catch(e){session=null;await saveSetting('session',null);renderAccountIdentity();status('Sessionen har gått ut. Logga in igen.',true);}}else if(mode==='local'){showApp();status(configured?'Lokalt läge – välj konto för automatisk synkning.':'Lokalt läge. För synkning behöver du först konfigurera Supabase.');}else status('Logga in för att fortsätta.');if('serviceWorker'in navigator&&location.protocol==='https:')navigator.serviceWorker.register('./sw.js').catch(()=>{});}catch(e){status('Kunde inte öppna lokal databas: '+e.message,true);}})();
