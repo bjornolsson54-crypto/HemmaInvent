@@ -13,8 +13,45 @@ function getSetting(key){return new Promise((res,rej)=>{let r=store('settings').
 function put(name,value){return new Promise((res,rej)=>{let r=store(name,'readwrite').put(value);r.onsuccess=()=>res();r.onerror=()=>rej(r.error);});}
 async function saveSetting(key,value){await put('settings',{key,value});}
 function userScope(){return session?.user?.id||'local';}
-async function refreshList(){records=(await all('records')).filter(r=>r.owner===userScope());render();}
-function showApp(){ clearDraft();categoryOpenState.clear(); $('auth').classList.add('hidden');$('app').classList.remove('hidden');$('settings').classList.add('hidden');$('editor').classList.add('hidden');$('overview').classList.remove('hidden');$('who').textContent=session?'Inloggad som '+session.user.email:'Lokalt läge – ingen automatisk synkning';refreshList();}
+async function refreshList(){const scope=userScope(),rows=await all('records');if(scope!==userScope())return;records=rows.filter(r=>r.owner===scope);render();}
+function showApp(){ clearDraft();categoryOpenState.clear(); $('auth').classList.add('hidden');$('app').classList.remove('hidden');$('settings').classList.add('hidden');$('editor').classList.add('hidden');$('overview').classList.remove('hidden');renderAccountIdentity();refreshList();}
+// Display names belong to the signed-in account, never to inventory records.
+function accountDisplayName(){
+  const metadata=session?.user?.user_metadata||{};
+  const name=metadata.display_name??metadata.full_name??metadata.name;
+  return typeof name==='string'?name.trim().slice(0,100):'';
+}
+function renderAccountIdentity(){
+  const name=accountDisplayName();
+  $('signedInUser').textContent=session?(name?'Inloggad '+name:'Inloggad · Ange namn'):'Inte inloggad';
+  $('signedInUser').disabled=!session;
+  $('who').textContent=session?(name?'Inloggad som '+name:'Inloggad – ange ditt namn nedan.'):'Lokalt läge – ingen automatisk synkning';
+  $('displayNameSection').classList.toggle('hidden',!session);
+}
+function openAccountSettings(){
+  clearDraft();$('overview').classList.add('hidden');$('editor').classList.add('hidden');$('settings').classList.remove('hidden');
+  renderAccountIdentity();$('displayName').value=accountDisplayName();$('profileStatus').textContent='';
+}
+let profileSaving=false;
+async function saveDisplayName(){
+  if(!session||profileSaving)return;
+  const name=$('displayName').value.trim();
+  if(!name||name.length>100){$('profileStatus').textContent='Ange ett namn med högst 100 tecken.';return;}
+  if(!navigator.onLine){$('profileStatus').textContent='Anslut till internet för att spara namnet på ditt konto.';return;}
+  if(busy){$('profileStatus').textContent='Vänta tills synkningen är klar och försök igen.';return;}
+  profileSaving=true;busy=true;$('saveDisplayName').disabled=true;$('displayName').disabled=true;$('sync').disabled=true;
+  $('profileStatus').textContent='Sparar namn …';
+  try{
+    const token=await ensureToken();
+    const response=await fetch(api+'/auth/v1/user',{method:'PUT',headers:authHeaders(token),body:JSON.stringify({data:{display_name:name}})});
+    const user=await response.json().catch(()=>({}));
+    if(!response.ok)throw Error(user.msg||user.message||'Namnet kunde inte sparas. Försök igen.');
+    if(user.id!==session.user.id)throw Error('Kontot kunde inte bekräftas. Logga in igen.');
+    session={...session,user};await saveSetting('session',session);renderAccountIdentity();
+    $('profileStatus').textContent='Namnet är sparat på ditt konto.';
+  }catch(error){$('profileStatus').textContent='Kunde inte spara namnet: '+error.message;}
+  finally{profileSaving=false;busy=false;$('saveDisplayName').disabled=false;$('displayName').disabled=false;$('sync').disabled=false;}
+}
 function warranty(r){if(!r.warrantyEnd)return '';let days=Math.ceil((new Date(r.warrantyEnd+'T12:00:00')-new Date())/86400000);return days<0?'<span class="pill bad">Garanti slut</span>':days<=30?'<span class="pill warn">Garanti går snart ut</span>':'<span class="pill">Garanti gäller</span>';}
 // Categories use the existing record payload, sync and backup format.
 const categoryOpenState=new Map();
@@ -290,12 +327,139 @@ mediaStage.addEventListener('touchcancel',()=>{swipe=null;},{passive:true});
 mediaStage.addEventListener('touchend',e=>{const start=swipe;swipe=null;if(!start||e.touches.length||!e.changedTouches.length||attachmentKind(mediaFiles[mediaIndex])!=='image')return;const dx=e.changedTouches[0].clientX-start.x,dy=e.changedTouches[0].clientY-start.y;if(Date.now()-start.time<1000&&Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy)*1.5)stepMedia(dx<0?1:-1);},{passive:true});
 
 async function toAttachment(file){if(file.type.startsWith('image/')){let bitmap=await createImageBitmap(file);let scale=Math.min(1,1400/Math.max(bitmap.width,bitmap.height));let canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(bitmap.width*scale));canvas.height=Math.max(1,Math.round(bitmap.height*scale));canvas.getContext('2d').drawImage(bitmap,0,0,canvas.width,canvas.height);bitmap.close();let quality=.76,data=canvas.toDataURL('image/jpeg',quality);while(data.length>1_300_000&&quality>.3){quality-=.12;data=canvas.toDataURL('image/jpeg',quality);}if(data.length>1_300_000)throw Error('Bilden är för stor även efter komprimering.');return {name:file.name.replace(/\.[^.]+$/,'.jpg'),type:'image/jpeg',data};}if(file.type!=='application/pdf')throw Error('Endast bilder och PDF stöds.');if(file.size>1_000_000)throw Error('PDF-filen får vara högst 1 MB.');return await new Promise((res,rej)=>{let r=new FileReader();r.onload=()=>res({name:file.name,type:file.type,data:r.result});r.onerror=()=>rej(r.error);r.readAsDataURL(file)});}
+// Authentication UI and recovery tokens are kept separate from inventory sessions.
+let authBusy=false,recoveryActive=false,recoverySession=null,resetRetryAt=0;
+const authControls=['login','signup','local','forgotPassword','createAccount','cancelSignup','sendReset','cancelResetRequest','saveNewPassword','cancelNewPassword'];
+function setAuthBusy(value){authBusy=value;for(const id of authControls)$(id).disabled=value;}
+function showAuthPanel(id='auth'){
+  clearDraft();$('app').classList.add('hidden');
+  for(const panel of ['auth','signupPanel','resetRequestPanel','resetPasswordPanel'])$(panel).classList.toggle('hidden',panel!==id);
+}
+function authRedirectUrl(){
+  const url=new URL(cfg.appUrl||location.href);
+  if(url.protocol!=='https:')throw Error('Öppna HemmaInvent på dess publicerade HTTPS-adress för att skicka mejllänkar.');
+  url.hash='';url.search='';return url.href;
+}
+async function authRequest(path,{method='POST',body,token}={}){
+  const response=await fetch(api+'/auth/v1/'+path,{method,headers:authHeaders(token),body:body===undefined?undefined:JSON.stringify(body)});
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok){
+    const message=response.status===429?'För många försök. Vänta en stund och försök igen.':data.msg||data.error_description||data.message||'Kontot kunde inte hanteras. Försök igen.';
+    throw Error(message);
+  }
+  return data;
+}
+async function acceptLogin(data){
+  if(!data.access_token||!data.refresh_token||!data.user?.id)throw Error('Inloggningen kunde inte bekräftas. Försök igen.');
+  session={...data,expires_at:Math.floor(Date.now()/1000)+Number(data.expires_in||3600)};
+  mode='cloud';records=[];await saveSetting('session',session);await saveSetting('mode',mode);
+  $('password').value='';$('signupPassword').value='';$('signupPasswordConfirm').value='';
+  for(const id of ['signupPanel','resetRequestPanel','resetPasswordPanel'])$(id).classList.add('hidden');
+  showApp();sync();
+}
+async function loginAccount(){
+  if(authBusy)return;if(!configured)return status('Konfigurera Supabase i config.js först.',true);
+  setAuthBusy(true);
+  try{await acceptLogin(await authRequest('token?grant_type=password',{body:{email:$('email').value.trim(),password:$('password').value}}));}
+  catch(error){status('Kunde inte logga in: '+error.message,true);}finally{setAuthBusy(false);}
+}
+async function signupAccount(){
+  if(authBusy)return;if(!configured)return status('Konfigurera Supabase i config.js först.',true);
+  const name=$('signupName').value.trim(),email=$('signupEmail').value.trim(),password=$('signupPassword').value;
+  if(!name||name.length>100){$('signupStatus').textContent='Ange ditt namn (högst 100 tecken).';return;}
+  if(password.length<8||password!==$('signupPasswordConfirm').value){$('signupStatus').textContent='Lösenorden måste vara lika och ha minst 8 tecken.';return;}
+  setAuthBusy(true);$('signupStatus').textContent='Skapar konto …';
+  try{
+    const data=await authRequest('signup?redirect_to='+encodeURIComponent(authRedirectUrl()),{body:{email,password,data:{display_name:name}}});
+    if(data.access_token)await acceptLogin(data);
+    else{
+      $('email').value=email;$('signupPassword').value='';$('signupPasswordConfirm').value='';
+      $('signupStatus').textContent='Kontrollera din e-post för att bekräfta registreringen och logga sedan in. Har du redan ett konto kan du logga in eller välja Glömt lösenord. Titta även i skräpposten.';
+    }
+  }catch(error){$('signupStatus').textContent='Kunde inte skapa konto: '+error.message;}finally{setAuthBusy(false);}
+}
+async function requestPasswordReset(){
+  if(authBusy)return;if(!configured)return status('Konfigurera Supabase i config.js först.',true);
+  if(Date.now()<resetRetryAt){$('resetRequestStatus').textContent='Vänta en minut innan du begär en ny länk.';return;}
+  setAuthBusy(true);$('resetRequestStatus').textContent='Skickar …';
+  try{
+    await authRequest('recover?redirect_to='+encodeURIComponent(authRedirectUrl()),{body:{email:$('resetEmail').value.trim()}});
+    resetRetryAt=Date.now()+60000;
+    $('resetRequestStatus').textContent='Om adressen hör till ett konto skickas ett mejl med en återställningslänk. Kontrollera även skräpposten.';
+  }catch(error){$('resetRequestStatus').textContent='Kunde inte skicka länken: '+error.message;}finally{setAuthBusy(false);}
+}
+function captureAuthCallback(){
+  const hash=new URLSearchParams(location.hash.slice(1)),query=new URLSearchParams(location.search);
+  const hasHash=['access_token','refresh_token','error','error_description','error_code'].some(key=>hash.has(key));
+  const hasQuery=['code','token_hash','error','error_description','error_code'].some(key=>query.has(key));
+  if(!hasHash&&!hasQuery)return null;
+  const callback={type:hash.get('type'),accessToken:hash.get('access_token'),refreshToken:hash.get('refresh_token'),expiresIn:Number(hash.get('expires_in')||3600),error:hash.has('error')||hash.has('error_code')||query.has('error')||query.has('error_code'),unsupported:hasQuery};
+  // Remove credentials and errors from the address before any network request.
+  for(const key of ['code','token_hash','type','error','error_description','error_code'])query.delete(key);
+  const search=query.toString();history.replaceState(null,'',location.pathname+(search?'?'+search:''));
+  return callback;
+}
+async function handleAuthCallback(callback){
+  if(!callback)return false;
+  if(callback.error||callback.unsupported){showAuthPanel();status('Mejllänken är ogiltig, har gått ut eller använder ett annat format. Välj Glömt lösenord för en ny länk, eller logga in om du just bekräftat din e-post.',true);return true;}
+  if(callback.type!=='recovery'){
+    showAuthPanel();status('Länken har behandlats. Logga in med din e-postadress och ditt lösenord.');return true;
+  }
+  recoveryActive=true;showAuthPanel('resetPasswordPanel');$('resetPasswordForm').classList.add('hidden');
+  $('resetPasswordStatus').textContent='Kontrollerar återställningslänken …';
+  try{
+    if(!configured||!callback.accessToken||!callback.refreshToken)throw Error('Återställningslänken är ofullständig.');
+    const user=await authRequest('user',{method:'GET',token:callback.accessToken});
+    if(!user.id)throw Error('Kontot kunde inte bekräftas.');
+    recoverySession={access_token:callback.accessToken,refresh_token:callback.refreshToken,user,expires_at:Math.floor(Date.now()/1000)+Math.min(Math.max(callback.expiresIn||3600,0),3600)};
+    // Do not replace an existing account session or start inventory sync here.
+    $('resetAccount').textContent='Välj ett nytt lösenord'+(user.user_metadata?.display_name?' för '+String(user.user_metadata.display_name).slice(0,100):'')+'.';
+    $('resetPasswordForm').classList.remove('hidden');$('resetPasswordStatus').textContent='';$('newPassword').focus();
+  }catch(error){
+    recoveryActive=false;recoverySession=null;showAuthPanel('resetRequestPanel');
+    $('resetRequestStatus').textContent='Länken kunde inte användas. Begär en ny länk. '+error.message;
+  }
+  return true;
+}
+async function finishPasswordReset(){
+  if(authBusy)return;
+  const password=$('newPassword').value;
+  if(password.length<8||password!==$('confirmNewPassword').value){$('resetPasswordStatus').textContent='Lösenorden måste vara lika och ha minst 8 tecken.';return;}
+  if(!recoverySession){$('resetPasswordStatus').textContent='Begär en ny återställningslänk.';return;}
+  setAuthBusy(true);$('resetPasswordStatus').textContent='Sparar nytt lösenord …';
+  try{
+    if(Date.now()>=recoverySession.expires_at*1000){
+      const renewed=await authRequest('token?grant_type=refresh_token',{body:{refresh_token:recoverySession.refresh_token}});
+      if(renewed.user?.id!==recoverySession.user.id)throw Error('Länken kunde inte bekräftas. Begär en ny länk.');
+      recoverySession={...recoverySession,...renewed,expires_at:Math.floor(Date.now()/1000)+Number(renewed.expires_in||3600)};
+    }
+    await authRequest('user',{method:'PUT',token:recoverySession.access_token,body:{password}});
+    const email=recoverySession.user.email||'';
+    // Ask for a fresh login after resetting, without importing or syncing any data.
+    session=null;mode='local';records=[];await saveSetting('session',null);await saveSetting('mode','local');
+    recoverySession=null;recoveryActive=false;$('newPassword').value='';$('confirmNewPassword').value='';$('password').value='';$('email').value=email;
+    showAuthPanel();renderAccountIdentity();status('Lösenordet är ändrat. Logga in med ditt nya lösenord.');
+  }catch(error){$('resetPasswordStatus').textContent='Kunde inte ändra lösenordet: '+error.message;}
+  finally{setAuthBusy(false);}
+}
+function cancelPasswordReset(){
+  if(authBusy)return;recoverySession=null;recoveryActive=false;$('newPassword').value='';$('confirmNewPassword').value='';showAuthPanel();status('Logga in för att fortsätta.');
+}
+async function returnToLogin(){
+  if(busy||editorSaving||authBusy){status('Vänta tills sparningen eller synkningen är klar.');return;}
+  if(!await confirmLeave())return;
+  session=null;mode='local';records=[];clearDraft();
+  await saveSetting('session',null);await saveSetting('mode','local');
+  $('list').replaceChildren();$('search').value='';$('categoryFilter').value='';
+  $('password').value='';showAuthPanel();renderAccountIdentity();status('Utloggad. Dina sparade inventarier finns kvar på enheten för ditt konto.');
+}
+
 function authHeaders(token){return {'apikey':cfg.supabaseAnonKey,'Authorization':'Bearer '+(token||cfg.supabaseAnonKey),'Content-Type':'application/json'};}
 async function authCall(path,body){let r=await fetch(api+'/auth/v1/'+path,{method:'POST',headers:authHeaders(),body:JSON.stringify(body)});let d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.msg||d.error_description||d.message||'Inloggning misslyckades');return d;}
 async function ensureToken(){if(!session)throw Error('Inte inloggad');if(Date.now()<(session.expires_at*1000-60000))return session.access_token;let data=await authCall('token?grant_type=refresh_token',{refresh_token:session.refresh_token});session={...data,expires_at:Math.floor(Date.now()/1000)+data.expires_in};await saveSetting('session',session);return session.access_token;}
 async function cloud(path,method='GET',body){let token=await ensureToken();let r=await fetch(api+'/rest/v1/'+path,{method,headers:{...authHeaders(token),...(method!=='GET'?{'Prefer':'resolution=merge-duplicates,return=minimal'}:{})},body:body===undefined?undefined:JSON.stringify(body)});if(!r.ok)throw Error('Molntjänst: '+r.status+' '+(await r.text()).slice(0,220));return method==='GET'?r.json():null;}
-async function sync(){if(!session){status('Lokalt läge – ingen synkning.');return;}if(!navigator.onLine){status('Offline. Ändringar sparas och synkas när internet återkommer.');return;}if(busy)return;busy=true;$('sync').disabled=true;try{status('Synkroniserar …');let local=(await all('records')).filter(r=>r.owner===userScope());let dirty=local.filter(r=>r.dirty);if(dirty.length){for(let r of dirty){await cloud('inventory','POST',{id:r.id,user_id:session.user.id,payload:{...r,dirty:false},updated_at:r.updatedAt});r.dirty=false;await put('records',r);}}
-let remote=await cloud('inventory?select=id,payload,updated_at&order=updated_at.desc&limit=10000');let current=new Map((await all('records')).filter(r=>r.owner===userScope()).map(r=>[r.id,r]));for(let row of remote){let existing=current.get(row.id);if(!existing||(!existing.dirty&&row.updated_at>existing.updatedAt)){await put('records',{...row.payload,owner:userScope(),updatedAt:row.updated_at,dirty:false});}}await refreshList();status('Synkat '+new Date().toLocaleTimeString('sv-SE')+'.');}catch(e){status('Synkning misslyckades: '+e.message+' – lokala ändringar finns kvar.',true);}finally{busy=false;$('sync').disabled=false;}}
+async function sync(){if(recoveryActive)return;if(!session){status('Lokalt läge – ingen synkning.');return;}if(!navigator.onLine){status('Offline. Ändringar sparas och synkas när internet återkommer.');return;}if(busy)return;busy=true;$('sync').disabled=true;try{status('Synkroniserar …');let local=(await all('records')).filter(r=>r.owner===userScope());let dirty=local.filter(r=>r.dirty);if(dirty.length){for(let r of dirty){await cloud('inventory','POST',{id:r.id,user_id:session.user.id,payload:{...r,dirty:false},updated_at:r.updatedAt});r.dirty=false;await put('records',r);}}
+let remote=await cloud('inventory?user_id=eq.'+encodeURIComponent(session.user.id)+'&select=id,user_id,payload,updated_at&order=updated_at.desc&limit=10000');const stored=await all('records'),foreignIds=new Set(stored.filter(r=>r.owner!==userScope()).map(r=>r.id));let current=new Map(stored.filter(r=>r.owner===userScope()).map(r=>[r.id,r]));for(let row of remote){if(foreignIds.has(row.id))throw Error('En post har samma ID som ett annat kontos lokala data. Inga uppgifter skrivs över.');if(row.user_id!==session.user.id)throw Error('Synkningen stoppades: ett annat kontos post mottogs. Kontrollera databasens åtkomstregler.');let existing=current.get(row.id);if(!existing||(!existing.dirty&&row.updated_at>existing.updatedAt)){await put('records',{...row.payload,owner:userScope(),updatedAt:row.updated_at,dirty:false});}}await refreshList();status('Synkat '+new Date().toLocaleTimeString('sv-SE')+'.');}catch(e){status('Synkning misslyckades: '+e.message+' – lokala ändringar finns kvar.',true);}finally{busy=false;$('sync').disabled=false;}}
 $('itemForm').onsubmit=async e=>{e.preventDefault();await saveItem();};
 $('delete').onclick=async()=>{
   if(busy||editorSaving){status('Vänta tills sparningen eller synkningen är klar.');return;}
@@ -313,7 +477,9 @@ $('delete').onclick=async()=>{
 $('new').onclick=()=>edit();
 $('cancel').onclick=async()=>{if(await confirmLeave())showOverview();};
 $('search').oninput=render;$('categoryFilter').onchange=render;$('sync').onclick=sync;
-$('account').onclick=async()=>{if(!await confirmLeave())return;clearDraft();$('overview').classList.add('hidden');$('editor').classList.add('hidden');$('settings').classList.remove('hidden');};
+$('account').onclick=async()=>{if(!await confirmLeave())return;openAccountSettings();};
+$('signedInUser').onclick=()=>$('account').click();
+$('displayNameForm').onsubmit=async e=>{e.preventDefault();await saveDisplayName();};
 $('closeSettings').onclick=()=>showOverview();
 $('homeLink').onclick=async e=>{e.preventDefault();if(!await confirmLeave())return;if(!$('app').classList.contains('hidden'))showOverview(true);window.scrollTo(0,0);};
 $('keepEditing').onclick=()=>finishLeave(false);$('discardChanges').onclick=()=>finishLeave(true);
@@ -327,11 +493,56 @@ $('editorNewSubcategory').onclick=()=>{categoryForEditor=true;openCategoryDialog
 $('newCategory').onclick=()=>{categoryForEditor=false;openCategoryDialog();};
 $('categoryCancel').onclick=()=>$('categoryDialog').close();
 $('categoryForm').onsubmit=async e=>{e.preventDefault();$('categoryCreate').disabled=true;try{const parent=$('categoryParent').value,name=$('categoryNewName').value.trim();if(await createCategory(parent,name)){if(categoryForEditor){setEditorCategory(parent?parent+' → '+name:name);chooseEditorCategory();}categoryForEditor=false;$('categoryDialog').close();}}finally{$('categoryCreate').disabled=false;}};
-$('login').onclick=async()=>{if(!configured)return status('Konfigurera Supabase i config.js först.',true);try{let d=await authCall('token?grant_type=password',{email:$('email').value.trim(),password:$('password').value});session={...d,expires_at:Math.floor(Date.now()/1000)+d.expires_in};await saveSetting('session',session);mode='cloud';await saveSetting('mode',mode);showApp();sync();}catch(e){status(e.message,true);}};
-$('signup').onclick=async()=>{if(!configured)return status('Konfigurera Supabase i config.js först.',true);try{let d=await authCall('signup',{email:$('email').value.trim(),password:$('password').value});if(d.access_token){session={...d,expires_at:Math.floor(Date.now()/1000)+d.expires_in};await saveSetting('session',session);mode='cloud';await saveSetting('mode',mode);showApp();sync();}else status('Kontot skapades. Bekräfta via e-post och logga sedan in.');}catch(e){status(e.message,true);}};
-$('local').onclick=async()=>{mode='local';session=null;await saveSetting('mode',mode);await saveSetting('session',null);showApp();status('Lokalt läge. Dina uppgifter synkas inte.');};
-$('logout').onclick=async()=>{if(!await confirmLeave())return;clearDraft();session=null;mode='local';await saveSetting('session',null);await saveSetting('mode','local');$('app').classList.add('hidden');$('auth').classList.remove('hidden');status('Utloggad. Molnposter är kvar lokalt på den här enheten.');};
+$('loginForm').onsubmit=async e=>{e.preventDefault();await loginAccount();};
+$('signup').onclick=()=>{if(authBusy)return;showAuthPanel('signupPanel');$('signupEmail').value=$('email').value.trim();$('signupStatus').textContent='';$('signupName').focus();};
+$('signupForm').onsubmit=async e=>{e.preventDefault();await signupAccount();};
+$('cancelSignup').onclick=()=>{if(!authBusy)showAuthPanel();};
+$('forgotPassword').onclick=()=>{if(authBusy)return;showAuthPanel('resetRequestPanel');$('resetEmail').value=$('email').value.trim();$('resetRequestStatus').textContent='';$('resetEmail').focus();};
+$('resetRequestForm').onsubmit=async e=>{e.preventDefault();await requestPasswordReset();};
+$('cancelResetRequest').onclick=()=>{if(!authBusy)showAuthPanel();};
+$('resetPasswordForm').onsubmit=async e=>{e.preventDefault();await finishPasswordReset();};
+$('cancelNewPassword').onclick=cancelPasswordReset;
+$('local').onclick=async()=>{if(authBusy)return;mode='local';session=null;records=[];await saveSetting('mode',mode);await saveSetting('session',null);showApp();status('Lokalt läge. Dina uppgifter synkas inte.');};
+$('logout').onclick=returnToLogin;
 $('export').onclick=async()=>{let data={format:'hemmainvent-v2',exportedAt:new Date().toISOString(),records:records};let blob=new Blob([JSON.stringify(data)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='hemmainvent-backup-'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);};
-$('importBtn').onclick=()=>$('importFile').click();$('importFile').onchange=async e=>{try{let file=e.target.files[0];if(!file)return;if(file.size>25_000_000)throw Error('Säkerhetskopian är för stor (max 25 MB).');let data=JSON.parse(await file.text());if(data.format!=='hemmainvent-v2'||!Array.isArray(data.records))throw Error('Felaktigt säkerhetskopieringsformat.');if(!confirm('Importera '+data.records.length+' poster till aktuellt konto?'))return;for(let r of data.records){if(typeof r.id!=='string'||typeof r.name!=='string'||!Array.isArray(r.attachments))continue;await put('records',{...r,owner:userScope(),dirty:!!session,updatedAt:new Date().toISOString()});}await refreshList();status('Import klar.');if(session)sync();}catch(err){status(err.message,true);}finally{e.target.value='';}};
+async function importBackupRecords(data,{locked=false}={}){
+  if(!locked&&(busy||editorSaving||authBusy))throw Error('Vänta tills sparningen eller synkningen är klar.');
+  if(data.format!=='hemmainvent-v2'||!Array.isArray(data.records))throw Error('Felaktigt säkerhetskopieringsformat.');
+  const scope=userScope(),existing=await all('records'),byId=new Map(existing.map(r=>[r.id,r])),rows=[];
+  for(const record of data.records){
+    if(typeof record.id!=='string'||typeof record.name!=='string'||!Array.isArray(record.attachments))continue;
+    let id=record.id;
+    if((record.owner&&record.owner!==scope)||(byId.has(id)&&byId.get(id).owner!==scope)){
+      // Stable copied IDs let repeated imports merge without overwriting another user's local records.
+      const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode('hemmainvent-import:'+scope+':'+record.id));
+      const chars=[...new Uint8Array(digest)].map(n=>n.toString(16).padStart(2,'0')).join('').slice(0,32).split('');
+      chars[12]='8';chars[16]=((parseInt(chars[16],16)&3)|8).toString(16);const hex=chars.join('');
+      id=hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20);
+    }
+    if(byId.has(id)&&byId.get(id).owner!==scope)throw Error('En post tillhör ett annat konto. Importen avbröts.');
+    rows.push({...record,id,owner:scope,dirty:!!session,updatedAt:new Date().toISOString()});
+  }
+  if(scope!==userScope())throw Error('Kontot ändrades. Importera igen.');
+  await writeRecords(rows);return rows.length;
+}
+$('importBtn').onclick=()=>$('importFile').click();
+$('importFile').onchange=async e=>{
+  if(busy||editorSaving||authBusy){status('Vänta tills sparningen eller synkningen är klar.');e.target.value='';return;}
+  // Prevent account switching or sync while the backup is being read and saved.
+  setAuthBusy(true);busy=true;$('sync').disabled=true;
+  try{
+    const file=e.target.files[0];if(!file)return;
+    if(file.size>25_000_000)throw Error('Säkerhetskopian är för stor (max 25 MB).');
+    const data=JSON.parse(await file.text());
+    if(data.format!=='hemmainvent-v2'||!Array.isArray(data.records))throw Error('Felaktigt säkerhetskopieringsformat.');
+    if(!confirm('Importera '+data.records.length+' poster till aktuellt konto?'))return;
+    // The handler owns the lock; the helper checks the current account again before writing.
+    const count=await importBackupRecords(data,{locked:true});
+    await refreshList();status('Import klar: '+count+' poster.');
+  }catch(error){status(error.message,true);}
+  finally{busy=false;setAuthBusy(false);$('sync').disabled=false;e.target.value='';}
+  if(session)sync();
+};
 window.addEventListener('online',()=>{if(session)sync();else status('Online.');});window.addEventListener('offline',()=>status('Offline – uppgifter sparas lokalt.'));
-(async()=>{try{db=await openDB();mode=await getSetting('mode')||'local';session=await getSetting('session')||null;if(mode==='cloud'&&session&&configured){try{await ensureToken();showApp();if(navigator.onLine)sync();else status('Offline – visar lokalt sparade inventarier.');}catch(e){session=null;await saveSetting('session',null);status('Sessionen har gått ut. Logga in igen.',true);}}else if(mode==='local'){showApp();status(configured?'Lokalt läge – välj konto för automatisk synkning.':'Lokalt läge. För synkning behöver du först konfigurera Supabase.');}else status('Logga in för att fortsätta.');if('serviceWorker'in navigator&&location.protocol==='https:')navigator.serviceWorker.register('./sw.js').catch(()=>{});}catch(e){status('Kunde inte öppna lokal databas: '+e.message,true);}})();
+const initialAuthCallback=captureAuthCallback();
+(async()=>{try{db=await openDB();mode=await getSetting('mode')||'local';session=await getSetting('session')||null;if(await handleAuthCallback(initialAuthCallback))return;if(mode==='cloud'&&session&&configured){try{if(navigator.onLine)await ensureToken();showApp();if(navigator.onLine)sync();else status('Offline – visar lokalt sparade inventarier.');}catch(e){session=null;await saveSetting('session',null);renderAccountIdentity();status('Sessionen har gått ut. Logga in igen.',true);}}else if(mode==='local'){showApp();status(configured?'Lokalt läge – välj konto för automatisk synkning.':'Lokalt läge. För synkning behöver du först konfigurera Supabase.');}else status('Logga in för att fortsätta.');if('serviceWorker'in navigator&&location.protocol==='https:')navigator.serviceWorker.register('./sw.js').catch(()=>{});}catch(e){status('Kunde inte öppna lokal databas: '+e.message,true);}})();
