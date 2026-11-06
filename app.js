@@ -81,7 +81,7 @@ function categoryPaths(){
   return [...paths].sort((a,b)=>a.localeCompare(b,'sv'));
 }
 
-function editorCategoryPaths(){return [...new Set([...categoryPaths(),'Färg & målning','Verktyg','Byggmaterial','Trädgård','Elektronik','Vitvaror','Övrigt'])].sort((a,b)=>a.localeCompare(b,'sv'));}
+function editorCategoryPaths(){return categoryPaths();}
 function categoryOption(select,value,label=value){const option=document.createElement('option');option.value=value;option.textContent=label;select.append(option);}
 function setEditorCategory(path){
   const normalized=categoryName({category:path}),root=normalized.split(' → ')[0];
@@ -165,6 +165,29 @@ async function renameCategory(name,newLeaf){
   finally{busy=false;$('sync').disabled=false;}
   if(session)sync();return true;
 }
+async function deleteCategory(path){
+  if(busy||editorSaving){status('Vänta tills sparningen eller synkningen är klar och försök igen.');return false;}
+  const affected=records.filter(r=>!r.deleted&&belowCategory(categoryName(r),path));
+  const count=affected.filter(isInventory).length;
+  if(count){status('Kategorin ”'+path+'” innehåller '+count+' inventarier, inklusive underkategorier. Flytta dem först via Redigera → Huvudkategori / Underkategori. Inga inventarier har tagits bort.',true);return false;}
+  if(!categoryPaths().includes(path))return false;
+  const descendants=categoryPaths().filter(p=>p!==path&&belowCategory(p,path)).length;
+  if(!confirm('Ta bort den tomma kategorin ”'+path+'”'+(descendants?' och dess '+descendants+' tomma underkategorier':'')+'?'))return false;
+  busy=true;$('sync').disabled=true;
+  try{
+    const updatedAt=new Date().toISOString();
+    const rows=affected.map(r=>({...r,deleted:true,dirty:!!session,updatedAt}));
+    // Removing the last subcategory must not also remove its parent.
+    const parts=path.split(' → ');parts.pop();const parent=parts.join(' → ');
+    if(parent&&!records.some(r=>!r.deleted&&!isInventory(r)&&categoryName(r)===parent))rows.push(categoryRecord(parent));
+    await writeRecords(rows);
+    for(const name of [...categoryOpenState.keys()])if(belowCategory(name,path))categoryOpenState.delete(name);
+    if(belowCategory($('categoryFilter').value,path))$('categoryFilter').value='';
+    await refreshList();status('Kategorin ”'+path+'” är borttagen.'+(session?' Ändringen synkas till dina andra enheter.':''));
+  }catch(error){status('Kunde inte ta bort kategorin: '+error.message,true);return false;}
+  finally{busy=false;$('sync').disabled=false;}
+  if(session)sync();return true;
+}
 function categoryTools(path){
   const tools=document.createElement('div');tools.className='row category-tools';
   const rename=document.createElement('button');rename.type='button';rename.className='secondary';rename.textContent='Byt kategorinamn';rename.setAttribute('aria-label','Byt namn på '+path);
@@ -176,7 +199,8 @@ function categoryTools(path){
   rename.onclick=()=>{rename.classList.add('hidden');form.classList.remove('hidden');input.value=categoryLeaf(path);input.focus();input.select();};
   cancel.onclick=()=>{form.classList.add('hidden');rename.classList.remove('hidden');rename.focus();};
   form.onsubmit=async e=>{e.preventDefault();save.disabled=true;try{if(await renameCategory(path,input.value)){form.classList.add('hidden');rename.classList.remove('hidden');}}finally{save.disabled=false;}};
-  form.append(input,save,cancel);tools.append(rename,sub,form);return tools;
+  const remove=document.createElement('button');remove.type='button';remove.className='secondary';remove.textContent='Ta bort kategori';remove.setAttribute('aria-label','Ta bort kategorin '+path);remove.onclick=()=>deleteCategory(path);
+  form.append(input,save,cancel);tools.append(rename,sub,remove,form);return tools;
 }
 function render(){
   const visible=records.filter(r=>!r.deleted&&isInventory(r)),term=$('search').value.toLowerCase().trim(),selected=$('categoryFilter').value,paths=categoryPaths();
