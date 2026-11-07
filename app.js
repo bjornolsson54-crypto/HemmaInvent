@@ -41,7 +41,7 @@ function renderAccountIdentity(){
 async function openAccountSettings(section='account'){
   closeAccountMenu();if(!await confirmLeave())return;
   clearDraft();$('overview').classList.add('hidden');$('editor').classList.add('hidden');$('settings').classList.remove('hidden');
-  renderAccountIdentity();$('displayName').value=accountDisplayName();$('profileStatus').textContent='';
+  renderAccountIdentity();renderLastExport();$('displayName').value=accountDisplayName();$('profileStatus').textContent='';
   $('settingsTitle').textContent=section==='backup'?'Säkerhetskopiering':(session?'Mitt konto':'På denna enhet');
   const target=section==='backup'?$('backupSection'):$('settingsTitle');target.focus();target.scrollIntoView({block:'start',behavior:'smooth'});
 }
@@ -63,7 +63,52 @@ async function saveDisplayName(){
     session={...session,user};await saveSetting('session',session);renderAccountIdentity();
     $('profileStatus').textContent='Namnet är sparat på ditt konto.';
   }catch(error){$('profileStatus').textContent='Kunde inte spara namnet: '+error.message;}
-  finally{profileSaving=false;busy=false;$('saveDisplayName').disabled=false;$('displayName').disabled=false;$('sync').disabled=false;}
+  finally{profileSaving=false;busy=false;$('saveDisplayName').disabled=false;$('displayName').disabled=false;$('sync').disabled=false;scheduleReturnSync();}
+}
+async function renderLastExport(){
+  const scope=userScope();$('lastExport').textContent='Läser senaste export …';
+  try{
+    const saved=await getSetting('lastExport:'+scope);if(scope!==userScope())return;
+    const date=saved?new Date(saved):null;
+    $('lastExport').textContent=date&&!Number.isNaN(date.getTime())?'Senast exporterad från denna enhet: '+date.toLocaleString('sv-SE',{year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit'}):'Ingen säkerhetskopia har exporterats för denna lista från denna enhet ännu.';
+  }catch{if(scope===userScope())$('lastExport').textContent='Datum för senaste export kunde inte läsas.';}
+}
+let exportBusy=false;
+async function exportBackup(){
+  if(exportBusy)return;
+  if(busy||editorSaving||authBusy){status('Vänta tills sparningen eller synkningen är klar innan du exporterar.');return;}
+  const scope=userScope();exportBusy=true;$('export').disabled=true;
+  let url;
+  try{
+    const rows=(await all('records')).filter(r=>r.owner===scope);
+    if(scope!==userScope())throw Error('Kontot ändrades. Starta exporten igen.');
+    const exportedAt=new Date().toISOString(),data={format:'hemmainvent-v2',exportedAt,records:rows};
+    url=URL.createObjectURL(new Blob([JSON.stringify(data)],{type:'application/json'}));
+    const link=document.createElement('a');link.href=url;link.download='hemmainvent-backup-'+exportedAt.slice(0,10)+'.json';link.click();
+    // A browser download can be started, but its completion cannot be verified here.
+    await saveSetting('lastExport:'+scope,exportedAt);
+    if(scope===userScope()){await renderLastExport();status('Exporten har startats. Kontrollera att JSON-filen sparas bland dina nedladdningar.');}
+  }catch(error){status('Exporten kunde inte slutföras: '+error.message,true);}
+  finally{if(url)setTimeout(()=>URL.revokeObjectURL(url),3000);exportBusy=false;$('export').disabled=false;scheduleReturnSync();}
+}
+// Only event-driven sync on return: no recurring background polling.
+let lastSyncAttemptAt=0,returnSyncPending=false,returnSyncTimer=null;
+function requestReturnSync(){
+  if(!session||recoveryActive||!navigator.onLine||document.visibilityState!=='visible'||$('app').classList.contains('hidden'))return;
+  returnSyncPending=true;scheduleReturnSync();
+}
+function scheduleReturnSync(){
+  if(!returnSyncPending||returnSyncTimer!==null)return;
+  returnSyncTimer=setTimeout(()=>{returnSyncTimer=null;tryReturnSync();},400);
+}
+function tryReturnSync(){
+  if(!returnSyncPending)return;
+  if(!session||recoveryActive||!navigator.onLine||document.visibilityState!=='visible'||$('app').classList.contains('hidden')){returnSyncPending=false;return;}
+  // Never disturb an inventory form, open dialog or an operation in progress.
+  if(busy||editorSaving||authBusy||exportBusy||!$('editor').classList.contains('hidden')||document.querySelector('dialog[open]'))return;
+  returnSyncPending=false;
+  if(Date.now()-lastSyncAttemptAt<30000)return;
+  sync();
 }
 function warranty(r){if(!r.warrantyEnd)return '';let days=Math.ceil((new Date(r.warrantyEnd+'T12:00:00')-new Date())/86400000);return days<0?'<span class="pill bad">Garanti slut</span>':days<=30?'<span class="pill warn">Garanti går snart ut</span>':'<span class="pill">Garanti gäller</span>';}
 // Categories use the existing record payload, sync and backup format.
@@ -125,7 +170,7 @@ async function createCategory(parent,name){
   busy=true;$('sync').disabled=true;
   try{await writeRecords([categoryRecord(path)]);categoryOpenState.set(path,true);await refreshList();status('Kategorin ”'+path+'” skapades.');}
   catch(e){status('Kunde inte skapa kategori: '+e.message,true);return false;}
-  finally{busy=false;$('sync').disabled=false;}
+  finally{busy=false;$('sync').disabled=false;scheduleReturnSync();}
   if(session)sync();return true;
 }
 function openCategoryDialog(parent=''){
@@ -162,7 +207,7 @@ async function renameCategory(name,newLeaf){
     }
     await refreshList();status('Kategorin heter nu ”'+newName+'”. Underkategorier och inventarier har följt med.');
   }catch(e){status('Kunde inte byta kategorinamn: '+e.message,true);return false;}
-  finally{busy=false;$('sync').disabled=false;}
+  finally{busy=false;$('sync').disabled=false;scheduleReturnSync();}
   if(session)sync();return true;
 }
 async function deleteCategory(path){
@@ -185,7 +230,7 @@ async function deleteCategory(path){
     if(belowCategory($('categoryFilter').value,path))$('categoryFilter').value='';
     await refreshList();status('Kategorin ”'+path+'” är borttagen.'+(session?' Ändringen synkas till dina andra enheter.':''));
   }catch(error){status('Kunde inte ta bort kategorin: '+error.message,true);return false;}
-  finally{busy=false;$('sync').disabled=false;}
+  finally{busy=false;$('sync').disabled=false;scheduleReturnSync();}
   if(session)sync();return true;
 }
 function categoryTools(path){
@@ -274,7 +319,7 @@ function finishLeave(discard){const resolve=leaveResolve;leaveResolve=null;leave
 function clearDraft(){editorBaseline=null;activeId=null;editingFiles=[];$('attachment').value='';}
 function showOverview(resetFilters=false){
   clearDraft();$('editor').classList.add('hidden');$('settings').classList.add('hidden');$('overview').classList.remove('hidden');
-  if(resetFilters){$('search').value='';$('categoryFilter').value='';}render();window.scrollTo(0,0);
+  if(resetFilters){$('search').value='';$('categoryFilter').value='';}render();scheduleReturnSync();window.scrollTo(0,0);
 }
 function togglePaint(){
   const enabled=$('paintEnabled').checked;$('paintFields').classList.toggle('hidden',!enabled);$('paintFields').disabled=!enabled;
@@ -310,7 +355,7 @@ async function saveItem(){
     for(const path of new Set([categoryName(data),...(existing?[categoryName(existing)]:[])]))if(!records.some(r=>!r.deleted&&!isInventory(r)&&categoryName(r)===path))rows.push(categoryRecord(path));
     await writeRecords(rows);await refreshList();showOverview();status('Sparad lokalt.'+(session?' Synkning startar.':''));
   }catch(e){status('Kunde inte spara: '+e.message,true);return false;}
-  finally{editorSaving=false;busy=false;$('sync').disabled=false;$('saveItem').disabled=false;$('itemForm').inert=false;}
+  finally{editorSaving=false;busy=false;$('sync').disabled=false;scheduleReturnSync();$('saveItem').disabled=false;$('itemForm').inert=false;}
   if(session)sync();return true;
 }
 
@@ -496,8 +541,8 @@ function authHeaders(token){return {'apikey':cfg.supabaseAnonKey,'Authorization'
 async function authCall(path,body){let r=await fetch(api+'/auth/v1/'+path,{method:'POST',headers:authHeaders(),body:JSON.stringify(body)});let d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.msg||d.error_description||d.message||'Inloggning misslyckades');return d;}
 async function ensureToken(){if(!session)throw Error('Inte inloggad');if(Date.now()<(session.expires_at*1000-60000))return session.access_token;let data=await authCall('token?grant_type=refresh_token',{refresh_token:session.refresh_token});session={...data,expires_at:Math.floor(Date.now()/1000)+data.expires_in};await saveSetting('session',session);return session.access_token;}
 async function cloud(path,method='GET',body){let token=await ensureToken();let r=await fetch(api+'/rest/v1/'+path,{method,headers:{...authHeaders(token),...(method!=='GET'?{'Prefer':'resolution=merge-duplicates,return=minimal'}:{})},body:body===undefined?undefined:JSON.stringify(body)});if(!r.ok)throw Error('Molntjänst: '+r.status+' '+(await r.text()).slice(0,220));return method==='GET'?r.json():null;}
-async function sync(){if(recoveryActive)return;if(!session){status('Lokalt läge – ingen synkning.');return;}if(!navigator.onLine){status('Offline. Ändringar sparas och synkas när internet återkommer.');return;}if(busy)return;busy=true;$('sync').disabled=true;try{status('Synkroniserar …');let local=(await all('records')).filter(r=>r.owner===userScope());let dirty=local.filter(r=>r.dirty);if(dirty.length){for(let r of dirty){await cloud('inventory','POST',{id:r.id,user_id:session.user.id,payload:{...r,dirty:false},updated_at:r.updatedAt});r.dirty=false;await put('records',r);}}
-let remote=await cloud('inventory?user_id=eq.'+encodeURIComponent(session.user.id)+'&select=id,user_id,payload,updated_at&order=updated_at.desc&limit=10000');const stored=await all('records'),foreignIds=new Set(stored.filter(r=>r.owner!==userScope()).map(r=>r.id));let current=new Map(stored.filter(r=>r.owner===userScope()).map(r=>[r.id,r]));for(let row of remote){if(foreignIds.has(row.id))throw Error('En post har samma ID som ett annat kontos lokala data. Inga uppgifter skrivs över.');if(row.user_id!==session.user.id)throw Error('Synkningen stoppades: ett annat kontos post mottogs. Kontrollera databasens åtkomstregler.');let existing=current.get(row.id);if(!existing||(!existing.dirty&&row.updated_at>existing.updatedAt)){await put('records',{...row.payload,owner:userScope(),updatedAt:row.updated_at,dirty:false});}}await refreshList();status('Synkat '+new Date().toLocaleTimeString('sv-SE')+'.');}catch(e){status('Synkning misslyckades: '+e.message+' – lokala ändringar finns kvar.',true);}finally{busy=false;$('sync').disabled=false;}}
+async function sync(){if(recoveryActive)return;if(!session){status('Lokalt läge – ingen synkning.');return;}if(!navigator.onLine){status('Offline. Ändringar sparas och synkas när internet återkommer.');return;}if(busy)return;lastSyncAttemptAt=Date.now();returnSyncPending=false;busy=true;$('sync').disabled=true;try{status('Synkroniserar …');let local=(await all('records')).filter(r=>r.owner===userScope());let dirty=local.filter(r=>r.dirty);if(dirty.length){for(let r of dirty){await cloud('inventory','POST',{id:r.id,user_id:session.user.id,payload:{...r,dirty:false},updated_at:r.updatedAt});r.dirty=false;await put('records',r);}}
+let remote=await cloud('inventory?user_id=eq.'+encodeURIComponent(session.user.id)+'&select=id,user_id,payload,updated_at&order=updated_at.desc&limit=10000');const stored=await all('records'),foreignIds=new Set(stored.filter(r=>r.owner!==userScope()).map(r=>r.id));let current=new Map(stored.filter(r=>r.owner===userScope()).map(r=>[r.id,r]));for(let row of remote){if(foreignIds.has(row.id))throw Error('En post har samma ID som ett annat kontos lokala data. Inga uppgifter skrivs över.');if(row.user_id!==session.user.id)throw Error('Synkningen stoppades: ett annat kontos post mottogs. Kontrollera databasens åtkomstregler.');let existing=current.get(row.id);if(!existing||(!existing.dirty&&row.updated_at>existing.updatedAt)){await put('records',{...row.payload,owner:userScope(),updatedAt:row.updated_at,dirty:false});}}await refreshList();status('Synkat '+new Date().toLocaleTimeString('sv-SE')+'.');}catch(e){status('Synkning misslyckades: '+e.message+' – lokala ändringar finns kvar.',true);}finally{busy=false;$('sync').disabled=false;scheduleReturnSync();}}
 $('itemForm').onsubmit=async e=>{e.preventDefault();await saveItem();};
 $('delete').onclick=async()=>{
   if(busy||editorSaving){status('Vänta tills sparningen eller synkningen är klar.');return;}
@@ -509,7 +554,7 @@ $('delete').onclick=async()=>{
     if(!records.some(x=>!x.deleted&&!isInventory(x)&&categoryName(x)===categoryName(r)))rows.push(categoryRecord(categoryName(r)));
     await writeRecords(rows);await refreshList();showOverview();status('Inventarien raderades.');
   }catch(e){status('Kunde inte radera: '+e.message,true);return;}
-  finally{busy=false;$('sync').disabled=false;}
+  finally{busy=false;$('sync').disabled=false;scheduleReturnSync();}
   if(session)sync();
 };
 $('new').onclick=()=>edit();
@@ -547,7 +592,7 @@ $('resetPasswordForm').onsubmit=async e=>{e.preventDefault();await finishPasswor
 $('cancelNewPassword').onclick=cancelPasswordReset;
 $('local').onclick=async()=>{if(authBusy)return;mode='local';session=null;records=[];await saveSetting('mode',mode);await saveSetting('session',null);showApp();status('Lokalt läge. Dina uppgifter synkas inte.');};
 
-$('export').onclick=async()=>{let data={format:'hemmainvent-v2',exportedAt:new Date().toISOString(),records:records};let blob=new Blob([JSON.stringify(data)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='hemmainvent-backup-'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);};
+$('export').onclick=exportBackup;
 async function importBackupRecords(data,{locked=false}={}){
   if(!locked&&(busy||editorSaving||authBusy))throw Error('Vänta tills sparningen eller synkningen är klar.');
   if(data.format!=='hemmainvent-v2'||!Array.isArray(data.records))throw Error('Felaktigt säkerhetskopieringsformat.');
@@ -583,9 +628,13 @@ $('importFile').onchange=async e=>{
     const count=await importBackupRecords(data,{locked:true});
     await refreshList();status('Import klar: '+count+' poster.');
   }catch(error){status(error.message,true);}
-  finally{busy=false;setAuthBusy(false);$('sync').disabled=false;e.target.value='';}
+  finally{busy=false;setAuthBusy(false);$('sync').disabled=false;scheduleReturnSync();e.target.value='';}
   if(session)sync();
 };
 window.addEventListener('online',()=>{renderConnectionState();if(session)sync();else status('Online. Lokalt läge synkas inte.');});window.addEventListener('offline',()=>{renderConnectionState();status(session?'Offline – ändringar sparas på enheten och synkas när internet återkommer.':'Offline – den separata lokala listan sparas på denna enhet.');});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')requestReturnSync();});
+window.addEventListener('focus',requestReturnSync);
+window.addEventListener('pageshow',event=>{if(event.persisted)requestReturnSync();});
+for(const dialog of document.querySelectorAll('dialog'))dialog.addEventListener('close',scheduleReturnSync);
 const initialAuthCallback=captureAuthCallback();
 (async()=>{try{db=await openDB();mode=await getSetting('mode')||'local';session=await getSetting('session')||null;if(await handleAuthCallback(initialAuthCallback))return;if(mode==='cloud'&&session&&configured){try{if(navigator.onLine)await ensureToken();showApp();if(navigator.onLine)sync();else status('Offline – visar lokalt sparade inventarier.');}catch(e){session=null;await saveSetting('session',null);renderAccountIdentity();status('Sessionen har gått ut. Logga in igen.',true);}}else if(mode==='local'){showApp();status(configured?'Lokalt läge – välj konto för automatisk synkning.':'Lokalt läge. För synkning behöver du först konfigurera Supabase.');}else status('Logga in för att fortsätta.');if('serviceWorker'in navigator&&location.protocol==='https:')navigator.serviceWorker.register('./sw.js').catch(()=>{});}catch(e){status('Kunde inte öppna lokal databas: '+e.message,true);}})();
